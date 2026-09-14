@@ -302,13 +302,13 @@ def _write_account_el(parent_el, acct_id, name, kmm_type, parent_acct_id,
 
 def _write_split_el(parent_el, split_id, account_id, shares, value,
                     payee_id='', price='1/1', memo='', number='',
-                    reconcile_flag_val='0'):
+                    reconcile_flag_val='0', action=''):
     xml_sub(parent_el, 'SPLIT',
             id=split_id, account=account_id,
             shares=shares, value=value, price=price,
             payee=payee_id, memo=memo, number=number,
             reconcileflag=reconcile_flag_val,
-            reconciledate='', action='', bankid='')
+            reconciledate='', action=action, bankid='')
 
 def build_kmy_xml(accounts, currencies, transactions,
                   acct_id_map, payee_id_map, curr_index, earliest_dates):
@@ -523,12 +523,13 @@ def build_kmy_xml(accounts, currencies, transactions,
             sp_acct_id = txn.get(f'{i}.acctid', '')
             sp_acct    = real_accounts.get(sp_acct_id)
             splits.append({
-                'acctid': sp_acct_id,
-                'pamt':   int(txn[f'{i}.pamt']),
-                'samt':   int(txn.get(f'{i}.samt', txn[f'{i}.pamt'])),
-                'dec':    acct_dec(sp_acct) if sp_acct else parent_dec,
-                'iso':    acct_iso(sp_acct) if sp_acct else parent_iso,
-                'desc':   txn.get(f'{i}.desc', ''),
+                'acctid':    sp_acct_id,
+                'pamt':      int(txn[f'{i}.pamt']),
+                'samt':      int(txn.get(f'{i}.samt', txn[f'{i}.pamt'])),
+                'dec':       acct_dec(sp_acct) if sp_acct else parent_dec,
+                'iso':       acct_iso(sp_acct) if sp_acct else parent_iso,
+                'desc':      txn.get(f'{i}.desc', ''),
+                'splittype': txn.get(f'{i}.invest.splittype', ''),
             })
             i += 1
 
@@ -569,9 +570,14 @@ def build_kmy_xml(accounts, currencies, transactions,
                 # KMyMoney expects the same sign: positive = entering the account.
                 sp_shares = to_rational(sp['samt'], sp['dec'])
                 sp_value  = to_rational(neg_pamt, parent_dec)
-                g         = gcd(abs(sp['samt']), abs(sp['pamt'])) if sp['pamt'] else 1
-                sp_price  = (f"{abs(sp['samt'])//g}/{abs(sp['pamt'])//g}"
-                             if sp['pamt'] else '1/1')
+                # price = value/shares = |pamt|×10^sp_dec / (|samt|×10^parent_dec)
+                if sp['pamt'] and sp['samt']:
+                    num_pr = abs(sp['pamt']) * (10 ** sp['dec'])
+                    den_pr = abs(sp['samt']) * (10 ** parent_dec)
+                    g_pr   = gcd(num_pr, den_pr)
+                    sp_price = f"{num_pr//g_pr}/{den_pr//g_pr}"
+                else:
+                    sp_price = '1/1'
 
                 # Collect first price for PRICES section
                 # price = |pamt| × 10^sp_dec / (|samt| × 10^parent_dec)
@@ -597,8 +603,16 @@ def build_kmy_xml(accounts, currencies, transactions,
                 sp_price  = '1/1'
 
             sp_memo = sp['desc'] if sp['desc'] and sp['desc'] != desc else memo
+            # Investment action: Buy/Sell for security splits
+            if sp['splittype'] == 'sec':
+                sp_action = 'Buy' if sp['samt'] > 0 else 'Sell'
+            elif sp['splittype'] == 'inc':
+                sp_action = 'Dividend'
+            else:
+                sp_action = ''
             _write_split_el(sp_el, f'S{j+2:04d}', sp_kmm_id,
-                            sp_shares, sp_value, price=sp_price, memo=sp_memo)
+                            sp_shares, sp_value, price=sp_price,
+                            memo=sp_memo, action=sp_action)
 
         written += 1
 
