@@ -167,6 +167,75 @@ def to_rational(subunits, dec):
     g = gcd(abs(n), d)
     return f"{n // g}/{d // g}"
 
+def loan_kvpairs(acct, acct_id_map):
+    """
+    Build KEYVALUEPAIRS dict for a Moneydance loan account (type='o').
+    Returns a dict ready to pass to xml_kvpairs().
+    """
+    import math
+
+    dec         = 2   # EUR always 2 dec
+    principal   = int(acct.get('init_principal', 0))   # EUR cents
+    rate_pct    = float(acct.get('int_rate', 0))        # annual %, e.g. 1.95
+    n_payments  = int(acct.get('num_payments', 0))
+    pmt_per_yr  = int(acct.get('pmts_per_year', 12))
+    monthly_pmt = float(acct.get('monthly_pmt', 0))    # EUR (already full)
+
+    # Opening date from creation_date (ms epoch) or fall back to field date_created
+    creation_ms = acct.get('creation_date', '')
+    if creation_ms:
+        from datetime import datetime as _dt, timezone
+        ts = int(creation_ms) / 1000
+        opening_date = _dt.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+    else:
+        d_str = acct.get('date_created', '')
+        opening_date = md_to_iso_date(d_str) if d_str else date.today().isoformat()
+
+    # Compute PMT if not stored
+    if monthly_pmt == 0 and principal > 0 and rate_pct > 0 and n_payments > 0:
+        r = (rate_pct / 100) / pmt_per_yr
+        pmt_full = principal / 100 * r / (1 - (1 + r) ** (-n_payments))
+        monthly_pmt = round(pmt_full, 2)
+
+    # Convert amounts to KMyMoney rational strings
+    def money_rational(eur_full):
+        """Convert a float EUR amount to rational string (cents)."""
+        cents = round(eur_full * 100)
+        g = gcd(abs(cents), 100)
+        return f"{cents // g}/{100 // g}"
+
+    # Interest rate as percentage rational (e.g. 1.95% → "195/100")
+    rate_cents = round(rate_pct * 100)
+    rate_g = gcd(abs(rate_cents), 100)
+    rate_rational = f"{rate_cents // rate_g}/{100 // rate_g}"
+
+    kvs = {
+        'loan-amount':                  to_rational(principal, dec),
+        f'interest-changedate:{opening_date}': rate_rational,
+        'term':                         str(n_payments),
+        'periodic-payment':             money_rational(monthly_pmt),
+        'final-payment':                money_rational(monthly_pmt),
+        'fixed-interest':               'yes',
+        'interest-calculation':         '0',   # 0 = normal annuity
+        'interest-changefrequency':     '0',   # 0 = no change (fixed rate)
+        'interest-nextchange':          '9999-12-31',
+    }
+
+    # Link payment account (escrow) and interest expense account
+    escrow_id = acct.get('escrow_account_id', '')
+    if escrow_id and escrow_id in acct_id_map:
+        kvs['kmm-loan-payment-acc'] = acct_id_map[escrow_id]
+
+    interest_id = acct.get('interest_account_id', '')
+    if interest_id and interest_id in acct_id_map:
+        kvs['kmm-loan-interest-acc'] = acct_id_map[interest_id]
+
+    # Mark inactive (closed) loans
+    if acct.get('is_inactive') == 'y':
+        kvs['mm-closed'] = 'yes'
+
+    return kvs
+
 def md_to_iso_date(s):
     """Convert Moneydance YYYYMMDD to YYYY-MM-DD, or '' if invalid."""
     s = (s or '').strip()
@@ -287,7 +356,7 @@ def build_id_maps(accounts, transactions):
 
 def _write_account_el(parent_el, acct_id, name, kmm_type, parent_acct_id,
                       currency_iso, opened='', description='',
-                      child_ids=None, number=''):
+                      child_ids=None, number='', extra_kvs=None):
     el = xml_sub(parent_el, 'ACCOUNT',
                  id=acct_id, name=name, type=str(kmm_type),
                  parentaccount=parent_acct_id, currency=currency_iso,
@@ -297,7 +366,10 @@ def _write_account_el(parent_el, acct_id, name, kmm_type, parent_acct_id,
         subs_el = ET.SubElement(el, 'SUBACCOUNTS')
         for cid in child_ids:
             xml_sub(subs_el, 'SUBACCOUNT', id=cid)
-    xml_kvpairs(el, {'lastStatementDate': ''})
+    kvs = {'lastStatementDate': ''}
+    if extra_kvs:
+        kvs.update(extra_kvs)
+    xml_kvpairs(el, kvs)
     return el
 
 def _write_split_el(parent_el, split_id, account_id, shares, value,
@@ -438,6 +510,8 @@ def build_kmy_xml(accounts, currencies, transactions,
             kmm_acct_id(c) for c in children_of.get(aid, [])
             if accounts[c].get('type') in REAL_TYPES
         )
+        extra = (loan_kvpairs(acct, acct_id_map)
+                 if acct.get('type') == 'o' else None)
         _write_account_el(
             accts_el,
             kmm_acct_id(aid),
@@ -449,6 +523,7 @@ def build_kmy_xml(accounts, currencies, transactions,
             description=acct.get('desc', ''),
             child_ids=child_ids or None,
             number=acct.get('number', ''),
+            extra_kvs=extra,
         )
 
     # ── TRANSACTIONS ──────────────────────────────────────────────────────────
