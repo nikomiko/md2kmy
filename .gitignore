@@ -1,0 +1,15 @@
+# Generated KMyMoney output
+*.kmy
+*.kmy.*~
+
+# Moneydance data files
+*.md
+
+# Exceptions: example/reference data
+!examples/
+!examples/**
+!moneydance-1.kmy
+
+# Python cache
+__pycache__/
+*.pyc
