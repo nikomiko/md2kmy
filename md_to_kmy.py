@@ -167,7 +167,7 @@ def to_rational(subunits, dec):
     g = gcd(abs(n), d)
     return f"{n // g}/{d // g}"
 
-def loan_kvpairs(acct, acct_id_map):
+def loan_kvpairs(acct, acct_id_map, schedule_id=None):
     """
     Build KEYVALUEPAIRS dict for a Moneydance loan account (type='o').
     Returns a dict ready to pass to xml_kvpairs().
@@ -234,7 +234,121 @@ def loan_kvpairs(acct, acct_id_map):
     if acct.get('is_inactive') == 'y':
         kvs['mm-closed'] = 'yes'
 
+    if schedule_id:
+        kvs['schedule'] = schedule_id
+
     return kvs
+
+
+def compute_loan_schedules(accounts, transactions):
+    """
+    For each active loan (type='o', not inactive, positive remaining balance),
+    compute the data needed to generate a KMyMoney SCHEDULE element.
+    Returns {md_loan_id: schedule_data_dict}.
+    """
+    import calendar as _cal
+
+    results = {}
+    loan_accounts = {aid: a for aid, a in accounts.items()
+                     if a.get('type') == 'o' and a.get('is_inactive') != 'y'}
+
+    for lid, loan in loan_accounts.items():
+        interest_acct_id = loan.get('interest_account_id', '')
+
+        loan_txns = []
+        for tid, t in transactions.items():
+            i = 0
+            while t.get(f'{i}.pamt') is not None:
+                if t.get(f'{i}.acctid') == lid:
+                    pamt = int(t.get(f'{i}.pamt', 0))
+                    interest_cents = 0
+                    j = 0
+                    while t.get(f'{j}.pamt') is not None:
+                        if t.get(f'{j}.acctid') == interest_acct_id:
+                            interest_cents = abs(int(t.get(f'{j}.pamt', 0)))
+                        j += 1
+                    loan_txns.append((t.get('dt', ''), pamt, interest_cents))
+                i += 1
+
+        if not loan_txns:
+            continue
+        loan_txns.sort()
+
+        balance_cents = sum(p for _, p, _ in loan_txns)
+        if balance_cents <= 0:
+            continue  # fully repaid / refinanced
+
+        payments = [(dt, pamt, interest) for dt, pamt, interest in loan_txns if pamt < 0]
+        if not payments:
+            continue
+
+        last_dt_str = payments[-1][0]
+        payments_made = len(payments)
+
+        principal_cents = int(loan.get('init_principal', 0))
+        rate_pct = float(loan.get('int_rate', 0))
+        n_payments = int(loan.get('num_payments', 0))
+        pmt_per_yr = int(loan.get('pmts_per_year', 12))
+
+        remaining = n_payments - payments_made
+        if remaining <= 0:
+            continue
+
+        # Next payment date = last payment + 1 month
+        ld_tmp = date(int(last_dt_str[:4]), int(last_dt_str[4:6]), int(last_dt_str[6:8]))
+        nm_tmp, ny_tmp = ld_tmp.month + 1, ld_tmp.year
+        ny_tmp += (nm_tmp - 1) // 12
+        nm_tmp = ((nm_tmp - 1) % 12) + 1
+        next_tmp = ld_tmp.replace(year=ny_tmp, month=nm_tmp,
+                                  day=min(ld_tmp.day, _cal.monthrange(ny_tmp, nm_tmp)[1]))
+        if next_tmp <= date.today():
+            continue  # loan completed or stale data — no future payments needed
+
+        if rate_pct > 0 and n_payments > 0 and principal_cents > 0:
+            r = (rate_pct / 100) / pmt_per_yr
+            pmt_full = (principal_cents / 100) * r / (1 - (1 + r) ** (-n_payments))
+            pmt_cents = round(pmt_full * 100)
+        else:
+            pmt_cents = abs(payments[-1][1]) + payments[-1][2]
+
+        r_monthly = (rate_pct / 100) / pmt_per_yr
+        next_interest_cents = round((balance_cents / 100) * r_monthly * 100)
+        next_principal_cents = pmt_cents - next_interest_cents
+
+        ld = date(int(last_dt_str[:4]), int(last_dt_str[4:6]), int(last_dt_str[6:8]))
+        nm, ny = ld.month + 1, ld.year
+        ny += (nm - 1) // 12
+        nm = ((nm - 1) % 12) + 1
+        next_date = ld.replace(year=ny, month=nm,
+                               day=min(ld.day, _cal.monthrange(ny, nm)[1]))
+
+        fd = payments[0][0]
+        start_date = date(int(fd[:4]), int(fd[4:6]), int(fd[6:8]))
+
+        ed = next_date
+        for _ in range(remaining - 1):
+            em, ey = ed.month + 1, ed.year
+            ey += (em - 1) // 12
+            em = ((em - 1) % 12) + 1
+            ed = ed.replace(year=ey, month=em,
+                            day=min(ed.day, _cal.monthrange(ey, em)[1]))
+        end_date = ed
+
+        results[lid] = {
+            'name':                 loan.get('name', ''),
+            'pmt_cents':            pmt_cents,
+            'next_interest_cents':  next_interest_cents,
+            'next_principal_cents': next_principal_cents,
+            'last_payment_date':    ld.isoformat(),
+            'next_payment_date':    next_date.isoformat(),
+            'start_date':           start_date.isoformat(),
+            'end_date':             end_date.isoformat(),
+            'bank_md_id':           loan.get('escrow_account_id', ''),
+            'interest_md_id':       interest_acct_id,
+        }
+
+    return results
+
 
 def md_to_iso_date(s):
     """Convert Moneydance YYYYMMDD to YYYY-MM-DD, or '' if invalid."""
@@ -451,6 +565,14 @@ def build_kmy_xml(accounts, currencies, transactions,
     for aid, acct in real_accounts.items():
         children_of[acct.get('parentid', '')].append(aid)
 
+    # Pre-compute active loan schedules so we can reference SCH IDs in account KVs
+    _active_loan_scheds = compute_loan_schedules(accounts, transactions)
+    _sch_counter = [0]
+    _loan_sch_ids = {}  # md_loan_id → 'SCH######'
+    for _lid in sorted(_active_loan_scheds.keys()):
+        _sch_counter[0] += 1
+        _loan_sch_ids[_lid] = f"SCH{_sch_counter[0]:06d}"
+
     # ── Root element ──────────────────────────────────────────────────────────
     root = ET.Element('KMYMONEY-FILE')
 
@@ -510,7 +632,8 @@ def build_kmy_xml(accounts, currencies, transactions,
             kmm_acct_id(c) for c in children_of.get(aid, [])
             if accounts[c].get('type') in REAL_TYPES
         )
-        extra = (loan_kvpairs(acct, acct_id_map)
+        extra = (loan_kvpairs(acct, acct_id_map,
+                              schedule_id=_loan_sch_ids.get(aid))
                  if acct.get('type') == 'o' else None)
         _write_account_el(
             accts_el,
@@ -700,8 +823,56 @@ def build_kmy_xml(accounts, currencies, transactions,
         'LastModificationDate': datetime.now().astimezone().isoformat(timespec='seconds'),
     })
 
-    # ── SCHEDULES / SECURITIES / CURRENCIES / PRICES / REPORTS / BUDGETS ─────
-    xml_sub(root, 'SCHEDULES', count='0')
+    # ── SCHEDULES ────────────────────────────────────────────────────────────
+    def _cents_r(c):
+        """Integer cents → KMyMoney rational string."""
+        c = int(c)
+        if c == 0:
+            return '0/1'
+        g = gcd(abs(c), 100)
+        return f"{c // g}/{100 // g}"
+
+    scheds_el = xml_sub(root, 'SCHEDULES',
+                        count=str(len(_active_loan_scheds)))
+    for _lid in sorted(_active_loan_scheds.keys()):
+        _s = _active_loan_scheds[_lid]
+        _sch_id = _loan_sch_ids[_lid]
+        _bank_kmm  = kmm_acct_id(_s['bank_md_id'])
+        _loan_kmm  = kmm_acct_id(_lid)
+        _int_kmm   = kmm_acct_id(_s['interest_md_id'])
+        _sch_el = ET.SubElement(scheds_el, 'SCHEDULE', attrib={
+            'id':                   _sch_id,
+            'name':                 _s['name'],
+            'type':                 '4',   # LoanPayment
+            'occurence':            '32',  # Monthly
+            'occurenceMultiplier':  '1',
+            'paymentType':          '1',   # DirectDebit
+            'startDate':            _s['start_date'],
+            'endDate':              _s['end_date'],
+            'lastPayment':          _s['last_payment_date'],
+            'autoEnter':            '0',
+            'fixed':                '1',
+            'lastDayInMonth':       '0',
+            'weekendOption':        '0',
+        })
+        ET.SubElement(_sch_el, 'PAYMENTS')
+        _txn_el = ET.SubElement(_sch_el, 'TRANSACTION', attrib={
+            'postdate':   _s['next_payment_date'],
+            'memo':       f"Mensualité {_s['name']}",
+            'id':         '',
+            'commodity':  base_iso,
+            'entrydate':  '',
+        })
+        _sp_el = ET.SubElement(_txn_el, 'SPLITS')
+        _total = _s['pmt_cents']
+        _princ = _s['next_principal_cents']
+        _inter = _s['next_interest_cents']
+        _write_split_el(_sp_el, 'S0001', _bank_kmm,
+                        shares=_cents_r(-_total), value=_cents_r(-_total))
+        _write_split_el(_sp_el, 'S0002', _loan_kmm,
+                        shares=_cents_r(_princ), value=_cents_r(_princ))
+        _write_split_el(_sp_el, 'S0003', _int_kmm,
+                        shares=_cents_r(_inter), value=_cents_r(_inter))
 
     # trading_currency[sym] = iso of currency in which the security is priced
     trading_currency = {iso: to_iso for iso, (_, _, to_iso) in sec_prices.items()}
